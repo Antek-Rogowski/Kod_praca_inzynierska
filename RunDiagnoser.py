@@ -4,7 +4,7 @@ import time
 import sys
 import os
 
-from ExampleDiagnosisSystem import ExampleDiagnosisSystem
+from FirstDiagnosisSystemClass import ExampleDiagnosisSystem
 
 TIMEOUT = 0.1
 

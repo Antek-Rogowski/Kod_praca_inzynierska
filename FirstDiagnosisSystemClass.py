@@ -59,7 +59,7 @@ class ExampleDiagnosisSystem(DiagnosisSystemClass):
         self._sample_count = 0      
 
     def Initialize(self):
-        print("Grey-Box init. Reading weights and scalers (Fast Mode)...")
+        print("Grey-Box init. Reading weights and scalers...")
         
         self.model0 = GreyBoxSystem(num_states=1, num_inputs=4) 
         self.model0.load_state_dict(torch.load(os.path.join('data', 'resources', 'weights_mso0.pth')))
@@ -195,8 +195,7 @@ class ExampleDiagnosisSystem(DiagnosisSystemClass):
             
             ywaf_true = arr[self._idx_ywaf]
             ewaf = abs(ywaf_true - ywaf_hat)
-
-            # --- WARMUP: przez pierwsze 50 próbek zerujemy residua ---
+            
             self._sample_count += 1
             if self._sample_count <= self.warmup_steps:
                 e0 = 0.0

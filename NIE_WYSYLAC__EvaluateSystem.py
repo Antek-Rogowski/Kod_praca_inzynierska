@@ -6,7 +6,7 @@ import numpy as np
 
 # --- KONFIGURACJA ---
 DATA_DIR = os.path.join('data', 'training_data')
-RESULTS_DIR = "results"  # <--- Dodany folder z wynikami
+RESULTS_DIR = "results" 
 FAULT_TIME_FILE = os.path.join(DATA_DIR, "ftp75city2_fault_time.txt")
 
 def load_ftp_fault_times(filepath):
@@ -16,7 +16,7 @@ def load_ftp_fault_times(filepath):
         return fault_times
         
     with open(filepath, 'r') as f:
-        lines = f.readlines()[1:] # Pomijamy nagłówek
+        lines = f.readlines()[1:] 
         for line in lines:
             parts = line.strip().split()
             if len(parts) >= 2:
@@ -50,7 +50,6 @@ def evaluate():
         
         print(f"Przetwarzanie: {basename}...")
         
-        # Uruchomienie RunDiagnoser
         result = subprocess.run(["python", "RunDiagnoser.py", file_path], capture_output=True, text=True)
         
         if result.returncode != 0:
@@ -58,7 +57,6 @@ def evaluate():
             print(f"  [!] Powód:\n{result.stderr}")
             continue
         
-        # POPRAWKA: Szukamy pliku prosto w folderze results
         output_file = os.path.join(RESULTS_DIR, f"output_{basename}")
         
         if not os.path.exists(output_file):

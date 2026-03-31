@@ -50,7 +50,7 @@ def evaluate():
         
         print(f"Przetwarzanie: {basename}...")
         
-        result = subprocess.run(["python", "RunDiagnoser.py", file_path], capture_output=True, text=True)
+        result = subprocess.run(["python", "-u", "RunDiagnoser.py", file_path], stderr=subprocess.PIPE, text=True)
         
         if result.returncode != 0:
             print(f"  [!] CRASH SKRYPTU RunDiagnoser.py na pliku {basename}!")

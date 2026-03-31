@@ -60,6 +60,7 @@ class ExampleDiagnosisSystem(DiagnosisSystemClass):
         self._sample_count = 0
 
     def Initialize(self):
+        torch.set_num_threads(1)
         print("Grey-Box init. Reading weights and scalers...")
 
         self.model0 = GreyBoxSystem(num_states=1, num_inputs=4)
@@ -114,27 +115,7 @@ class ExampleDiagnosisSystem(DiagnosisSystemClass):
         self.ywaf_s = scaler_ywaf.scale_[0]
         self.ywaf_m = scaler_ywaf.min_[0]
 
-        # --- Shared-memory numpy<->tensor bufory wejściowe ---
-        self._u0_np   = np.zeros((1, 4), dtype=np.float32)
-        self._u10_np  = np.zeros((1, 3), dtype=np.float32)
-        self._u1_np   = np.zeros((1, 7), dtype=np.float32)
-        self._uwaf_np = np.zeros((1, 3), dtype=np.float32)
 
-        self._u0_t   = torch.from_numpy(self._u0_np)
-        self._u10_t  = torch.from_numpy(self._u10_np)
-        self._u1_t   = torch.from_numpy(self._u1_np)
-        self._uwaf_t = torch.from_numpy(self._uwaf_np)
-
-        self._u0_norm   = torch.zeros(1, 4)
-        self._u10_norm  = torch.zeros(1, 3)
-        self._u1_norm   = torch.zeros(1, 7)
-        self._uwaf_norm = torch.zeros(1, 3)
-
-        # ----------------------------------------------------------------
-        # Pre-alokacja połączonych buforów [state | u_norm].
-        # Eliminuje torch.cat wewnątrz step() — 4 alokacje × każda próbka.
-        # Widoki (_x, _u) pozwalają wypełniać fragmenty bez kopiowania.
-        # ----------------------------------------------------------------
         self._inp0   = torch.zeros(1, 1 + 4)
         self._inp10  = torch.zeros(1, 1 + 3)
         self._inp1   = torch.zeros(1, 5 + 7)
@@ -149,117 +130,124 @@ class ExampleDiagnosisSystem(DiagnosisSystemClass):
         self._inpwaf_x = self._inpwaf[:, :1]
         self._inpwaf_u = self._inpwaf[:, 1:]
 
-        # Stałe T potrzebne do in-place update stanu
         self._T0   = self.model0.T
         self._T10  = self.model10.T
         self._T1   = self.model1.T
         self._Twaf = self.modelwaf.T
 
-        # Bezpośrednie referencje do sieci — eliminuje lookup atrybutu per krok
-        self._g0   = self.model0.g_func
-        self._h0   = self.model0.h_func
-        self._g10  = self.model10.g_func
-        self._h10  = self.model10.h_func
-        self._g1   = self.model1.g_func
-        self._h1   = self.model1.h_func
-        self._gwaf = self.modelwaf.g_func
-        self._hwaf = self.modelwaf.h_func
+        dummy_inp0 = torch.zeros(1, 1 + 4)
+        self._g0 = torch.jit.trace(self.model0.g_func, dummy_inp0)
+        self._h0 = torch.jit.trace(self.model0.h_func, dummy_inp0)
+        
+        dummy_inp10 = torch.zeros(1, 1 + 3)
+        self._g10 = torch.jit.trace(self.model10.g_func, dummy_inp10)
+        self._h10 = torch.jit.trace(self.model10.h_func, dummy_inp10)
+        
+        dummy_inp1 = torch.zeros(1, 5 + 7)
+        self._g1 = torch.jit.trace(self.model1.g_func, dummy_inp1)
+        self._h1 = torch.jit.trace(self.model1.h_func, dummy_inp1)
+        
+        dummy_inpwaf = torch.zeros(1, 1 + 3)
+        self._gwaf = torch.jit.trace(self.modelwaf.g_func, dummy_inpwaf)
+        self._hwaf = torch.jit.trace(self.modelwaf.h_func, dummy_inpwaf)
+
+        self._isolation_out = np.zeros((1, 5), dtype=float)
+        self._obs_versor = np.zeros(4, dtype=float)
+        self._case_override = np.array([[0.0, 0.0, 0.0, 0.0, 1.0]], dtype=float)
+        self._no_detection = ([0], self._isolation_out)
 
         print("Models loaded. Ready to use.")
 
-    # Dekorator zamiast `with torch.inference_mode()` — zero narzutu
-    # context managera per wywołanie Input()
     @torch.inference_mode()
     def Input(self, sample):
-        if not hasattr(self, '_cols_mapped'):
-            cols = sample.columns.tolist()
+        arr = sample.values.ravel() if hasattr(sample, 'values') else sample
 
-            self._idx_u0  = np.array([cols.index(c) for c in self.u0_cols])
+        if not hasattr(self, '_cols_mapped'):
+            cols = sample.columns.tolist() if hasattr(sample, 'columns') else None
+            
+            self._idx_u0  = [cols.index(c) for c in self.u0_cols]
             self._idx_y0  = cols.index(self.y0_cols[0])
             self._idx_pim = cols.index('intake_manifold_pressure')
             self._idx_pic = cols.index('Intercooler_pressure')
             self._idx_amf = cols.index('air_mass_flow')
             self._idx_thr = cols.index('throttle_position')
             self._idx_eng = cols.index('engine_speed')
+            self._idx_u10 = [self._idx_pim, self._idx_pic, self._idx_amf, self._idx_thr] 
             self._idx_y10 = cols.index(self.y10_cols[0])
-            self._idx_u1  = np.array([cols.index(c) for c in self.u1_cols])
+            self._idx_u1  = [cols.index(c) for c in self.u1_cols]
             self._idx_y1  = cols.index(self.y1_cols[0])
             self._idx_ywaf = cols.index(self.ywaf_cols[0])
+
+            self._idx_u0_t = torch.tensor(self._idx_u0, dtype=torch.long)
+            self._idx_u1_t = torch.tensor(self._idx_u1, dtype=torch.long)
 
             def make_versor(vec):
                 norm = np.linalg.norm(vec)
                 return vec / norm if norm > 0 else vec
 
             self._signatures = np.array([
-                make_versor(np.array([1, 1, 0, 0], dtype=float)),  # fpic
-                make_versor(np.array([1, 1, 1, 0], dtype=float)),  # fpim
-                make_versor(np.array([0, 0, 0, 1], dtype=float)),  # fwaf
-                make_versor(np.array([1, 0, 1, 1], dtype=float)),  # fiml
+                make_versor(np.array([1, 1, 0, 0], dtype=float)),
+                make_versor(np.array([1, 1, 1, 0], dtype=float)),
+                make_versor(np.array([0, 0, 0, 1], dtype=float)),
+                make_versor(np.array([1, 0, 1, 1], dtype=float)),
             ])
             self._cols_mapped = True
 
-        arr = sample.values[0]
+        arr_t = torch.from_numpy(arr).float()
 
-        # --- MSO0 ---
-        np.copyto(self._u0_np[0], arr[self._idx_u0])
-        torch.mul(self._u0_t, self.u0_s, out=self._u0_norm)
-        self._u0_norm.add_(self.u0_m)
-        # Wypełnij [state | u_norm] bez torch.cat
+        self._inp0_u[0].copy_(arr_t[self._idx_u0_t])
+        self._inp0_u.mul_(self.u0_s).add_(self.u0_m)
         self._inp0_x.copy_(self.x0)
-        self._inp0_u.copy_(self._u0_norm)
+        
         y0_hat_norm = self._h0(self._inp0)
-        # In-place update stanu — eliminuje alokację tensora x_next
         self.x0.add_(self._g0(self._inp0), alpha=self._T0)
+        
         y0_hat = (y0_hat_norm.item() - self.y0_m) / self.y0_s
         e0 = abs(arr[self._idx_y0] - y0_hat)
 
-        # --- MSO10 ---
         pim = arr[self._idx_pim]
         pic = arr[self._idx_pic]
         amf = arr[self._idx_amf]
         thr = arr[self._idx_thr]
-        delta_p = math.sqrt(abs(pim - pic))
-        self._u10_np[0, 0] = delta_p
-        self._u10_np[0, 1] = amf
-        self._u10_np[0, 2] = thr
-        torch.mul(self._u10_t, self.u10_s, out=self._u10_norm)
-        self._u10_norm.add_(self.u10_m)
+        
+        self._inp10_u[0, 0] = math.sqrt(abs(pim - pic))
+        self._inp10_u[0, 1] = amf
+        self._inp10_u[0, 2] = thr
+        
+        self._inp10_u.mul_(self.u10_s).add_(self.u10_m)
         self._inp10_x.copy_(self.x10)
-        self._inp10_u.copy_(self._u10_norm)
+        
         y10_hat_norm = self._h10(self._inp10)
         self.x10.add_(self._g10(self._inp10), alpha=self._T10)
+        
         y10_hat = (y10_hat_norm.item() - self.y10_m) / self.y10_s
         e10 = abs(arr[self._idx_y10] - y10_hat)
 
-        # --- MSO1 ---
-        np.copyto(self._u1_np[0], arr[self._idx_u1])
-        torch.mul(self._u1_t, self.u1_s, out=self._u1_norm)
-        self._u1_norm.add_(self.u1_m)
+        self._inp1_u[0].copy_(arr_t[self._idx_u1_t])
+        self._inp1_u.mul_(self.u1_s).add_(self.u1_m)
         self._inp1_x.copy_(self.x1)
-        self._inp1_u.copy_(self._u1_norm)
+        
         y1_hat_norm = self._h1(self._inp1)
         self.x1.add_(self._g1(self._inp1), alpha=self._T1)
+        
         y1_hat = (y1_hat_norm.item() - self.y1_m) / self.y1_s
         e1 = abs(arr[self._idx_y1] - y1_hat)
 
-        # --- WAF ---
         eng_speed = arr[self._idx_eng]
-        epsilon = 1e-6
-        waf_x1 = math.log(eng_speed + epsilon) * amf
-        waf_x3 = math.log(thr + epsilon)
-        self._uwaf_np[0, 0] = waf_x1
-        self._uwaf_np[0, 1] = amf
-        self._uwaf_np[0, 2] = waf_x3
-        torch.mul(self._uwaf_t, self.uwaf_s, out=self._uwaf_norm)
-        self._uwaf_norm.add_(self.uwaf_m)
+        
+        self._inpwaf_u[0, 0] = math.log(eng_speed + 1e-6) * amf
+        self._inpwaf_u[0, 1] = amf
+        self._inpwaf_u[0, 2] = math.log(thr + 1e-6)
+        
+        self._inpwaf_u.mul_(self.uwaf_s).add_(self.uwaf_m)
         self._inpwaf_x.copy_(self.xwaf)
-        self._inpwaf_u.copy_(self._uwaf_norm)
+        
         ywaf_hat_norm = self._hwaf(self._inpwaf)
         self.xwaf.add_(self._gwaf(self._inpwaf), alpha=self._Twaf)
+        
         ywaf_hat = (ywaf_hat_norm.item() - self.ywaf_m) / self.ywaf_s
         ewaf = abs(arr[self._idx_ywaf] - ywaf_hat)
 
-        # --- Warmup / filtracja ---
         self._sample_count += 1
         if self._sample_count <= self.warmup_steps:
             e0 = e10 = e1 = ewaf = 0.0
@@ -274,32 +262,34 @@ class ExampleDiagnosisSystem(DiagnosisSystemClass):
         b1   = 1 if self.e1_filt   > self.th1   else 0
         bwaf = 1 if self.ewaf_filt > self.thwaf else 0
 
-        detection = [1] if (b0 or b10 or b1 or bwaf) else [0]
-        isolation = np.zeros((1, 5))
+        if not (b0 or b10 or b1 or bwaf):
+            self._isolation_out.fill(0.0)
+            return self._no_detection
 
-        if detection[0] == 1:
-            obs_norm = math.sqrt(b0*b0 + b10*b10 + b1*b1 + bwaf*bwaf)
-            if obs_norm > 0:
-                observed_versor = np.array([b0/obs_norm, b10/obs_norm, b1/obs_norm, bwaf/obs_norm], dtype=float)
-            else:
-                observed_versor = np.array([0.0, 0.0, 0.0, 0.0], dtype=float)
+        obs_norm = math.sqrt(b0 + b10 + b1 + bwaf)
+        self._isolation_out.fill(0.0)
 
-            scores = np.dot(self._signatures, observed_versor)
-            total_score = np.sum(scores)
+        if obs_norm > 0:
+            self._obs_versor[0] = b0 / obs_norm
+            self._obs_versor[1] = b10 / obs_norm
+            self._obs_versor[2] = b1 / obs_norm
+            self._obs_versor[3] = bwaf / obs_norm
+        else:
+            self._obs_versor.fill(0.0)
 
-            if total_score > 0:
-                isolation[0, :4] = scores / total_score
-            else:
-                isolation[0, 4] = 1.0
+        scores = np.dot(self._signatures, self._obs_versor)
+        total_score = np.sum(scores)
 
-            max_idx = np.argmax(isolation[0])
-            isolation = np.zeros((1, 5))
-            isolation[0, max_idx] = 1.0
+        if total_score > 0:
+            self._isolation_out[0, :4] = scores / total_score
+        else:
+            self._isolation_out[0, 4] = 1.0
 
-            case1 = (b0 == 0 and b10 == 1 and b1 == 1 and bwaf == 1)
-            case2 = (b0 == 1 and b10 == 1 and b1 == 1 and bwaf == 1)
+        max_idx = np.argmax(self._isolation_out[0])
+        self._isolation_out.fill(0.0)
+        self._isolation_out[0, max_idx] = 1.0
 
-            if case1 or case2:
-                isolation = np.array([[0.0, 0.0, 0.0, 0.0, 1.0]])
+        if b10 and b1 and bwaf: 
+            return [1], self._case_override
 
-        return detection, isolation
+        return [1], self._isolation_out

@@ -6,7 +6,7 @@ import os
 
 from FirstDiagnosisSystemClass import ExampleDiagnosisSystem
 
-TIMEOUT = 0.08
+TIMEOUT = 0.1
 
 ## Create diagnosis system class
 
